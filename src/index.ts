@@ -159,8 +159,13 @@ export default Plugin.define({
     }
 
     await ctx.provider.transform((editor) => {
-      if (!editor.get(PROVIDER_ID)) {
+      const existing = editor.get(PROVIDER_ID)
+      if (!existing) {
         editor.add({ info: providerInfo(), models: source.models })
+      } else if (existing.provider.integrationID === PROVIDER_ID) {
+        // Keep the account-specific inventory in sync with later reloads
+        // (login, refresh) without clobbering a user-defined provider.
+        editor.models.set(PROVIDER_ID, source.models)
       }
     })
 
