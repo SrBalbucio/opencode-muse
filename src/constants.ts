@@ -53,3 +53,7 @@ export const REASONING_EFFORTS: ReadonlySet<string> = new Set([
 // bit before the checkpoint so we never race it.
 export const MINT_TTL_MS = 24 * 60 * 60 * 1000
 export const REFRESH_SAFETY_WINDOW_MS = 5 * 60 * 1000
+
+// Minimum gap between forced re-mints for one session after an auth failure,
+// so a persistently rejected key cannot trigger a mint on every retry.
+export const AUTH_RETRY_COOLDOWN_MS = 60 * 1000

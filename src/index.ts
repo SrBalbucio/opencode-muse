@@ -1,15 +1,7 @@
 import { Plugin } from "@opencode/plugin"
-import {
-  ACCOUNT_URL,
-  MINT_TTL_MS,
-  OAUTH_METHOD_ID,
-  PLUGIN_ID,
-  PROVIDER_ID,
-  SUBSCRIBE_URL,
-} from "./constants.ts"
+import { ACCOUNT_URL, MINT_TTL_MS, OAUTH_METHOD_ID, PLUGIN_ID, PROVIDER_ID } from "./constants.ts"
 import {
   credentialLabel,
-  isAuthRetryable,
   isCredentialExpiring,
   isMuseOAuthCredential,
   providerInfo,
@@ -20,35 +12,16 @@ import {
 } from "./models.ts"
 import { readMuseCliAuth } from "./muse-store.ts"
 import {
-  listModels,
-  mintApiKey,
-  pollDeviceToken,
-  startDeviceAuth,
-  type MintResponse,
-} from "./oauth.ts"
+  registerMuseProvider,
+  retryWithFreshKey,
+  subscriptionRequiredMessage,
+  subscriptionSummary,
+} from "./hooks.ts"
+import { listModels, mintApiKey, pollDeviceToken, startDeviceAuth } from "./oauth.ts"
 
 // IMPORTANT: this module's default export is the whole plugin definition.
 // Keep supporting modules beside it; the loader treats every top-level file
 // as a plugin candidate, so only this file may default-export a definition.
-
-/**
- * One-line subscription summary for the login screen (plugin stdout is not
- * surfaced anywhere, so the visible `instructions` field carries it).
- */
-function subscriptionSummary(minted: MintResponse): string {
-  const parts: string[] = []
-  if (minted.subs_tier_name) parts.push(minted.subs_tier_name)
-  const window = minted.subs_usage?.window
-  const weekly = minted.subs_usage?.weekly
-  const usage: string[] = []
-  if (window?.used_percent !== undefined) usage.push(`${window.used_percent}% window`)
-  if (weekly?.used_percent !== undefined) usage.push(`${weekly.used_percent}% weekly`)
-  if (usage.length > 0) parts.push(`usage ${usage.join(", ")}`)
-  if (minted.require_payment || minted.is_subs_active === false) {
-    parts.push(`action required: ${minted.action_url ?? SUBSCRIBE_URL}`)
-  }
-  return parts.length > 0 ? ` (${parts.join(" · ")})` : ""
-}
 
 /**
  * Muse subscription for opencode, mirroring the official `muse` CLI:
@@ -70,7 +43,7 @@ export default Plugin.define({
     const source = { models: staticModelInfos() }
     let override: { access: string; expiresAt: number } | undefined
     let mintPromise: Promise<string> | undefined
-    const retried = new Set<string>()
+    const authRetries = new Map<string, number>()
 
     const loadInventory = async (apiKey: string) => {
       try {
@@ -159,14 +132,7 @@ export default Plugin.define({
     }
 
     await ctx.provider.transform((editor) => {
-      const existing = editor.get(PROVIDER_ID)
-      if (!existing) {
-        editor.add({ info: providerInfo(), models: source.models })
-      } else if (existing.provider.integrationID === PROVIDER_ID) {
-        // Keep the account-specific inventory in sync with later reloads
-        // (login, refresh) without clobbering a user-defined provider.
-        editor.models.set(PROVIDER_ID, source.models)
-      }
+      registerMuseProvider(editor, providerInfo(), source.models)
     })
 
     await ctx.integration.transform((editor) => {
@@ -204,6 +170,8 @@ export default Plugin.define({
             callback: (async () => {
               const tokens = await pollDeviceToken(device)
               const minted = await mintApiKey(tokens.access_token)
+              const action = subscriptionRequiredMessage(minted)
+              if (action) throw new Error(action)
               const credential = toOAuthCredential(tokens.access_token, minted)
               await refreshModels(minted.api_key)
               return credential
@@ -234,20 +202,15 @@ export default Plugin.define({
     await ctx.session.hook(
       "retry",
       async (event) => {
-        if (
-          !isAuthRetryable({ status: event.error.status, type: event.error.type, message: event.error.message })
-        ) {
-          return
-        }
-        const key = `${event.sessionID}:${event.attempt}`
-        if (retried.has(key)) return
         try {
-          const credential = await resolveCredential()
-          const dca = credential?.refresh ?? (await readMuseCliAuth())?.accessToken
-          if (!dca) return
-          await mintFresh(dca)
-          retried.add(key)
-          event.decision = { retry: true, delay: 0 }
+          await retryWithFreshKey(event, {
+            lastRetryAt: authRetries,
+            resolveToken: async () => {
+              const credential = await resolveCredential()
+              return credential?.refresh ?? (await readMuseCliAuth())?.accessToken
+            },
+            mint: mintFresh,
+          })
         } catch {
           // Let the original error stand.
         }
