@@ -24,14 +24,15 @@ the browser approval entirely.
 
 - OpenCode v2 (`opencode --version` shows `2.x`)
 - A Muse Code subscription (or a Meta account eligible for one)
+- pnpm 11 (`corepack enable` uses the version pinned in `package.json`)
 
 ## Install
 
 ```sh
 git clone https://github.com/danzilberdan/opencode-muse.git
 cd opencode-muse
-npm install
-npm run build
+pnpm install
+pnpm run build
 cp dist/muse.js ~/.config/opencode/plugins/muse.js
 opencode reload
 ```
@@ -91,10 +92,10 @@ Valid tiers: `minimal`, `low`, `medium`, `high` (default), `xhigh`, `max`.
 ## Development
 
 ```sh
-npm install
-npm run typecheck   # tsc --noEmit
-npm test            # node --test
-npm run build       # dist/muse.js single-file bundle for local installs
+pnpm install
+pnpm run typecheck   # tsc --noEmit
+pnpm test            # node --test
+pnpm run build       # dist/muse.js single-file bundle for local installs
 ```
 
 Layout:

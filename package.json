@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "OpenCode plugin that brings the official Muse Code subscription (OAuth device flow, like the muse CLI) to opencode as an OpenAI-compatible provider.",
   "license": "MIT",
+  "packageManager": "pnpm@11.20.0",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
