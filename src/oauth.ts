@@ -1,6 +1,13 @@
+// Device-flow auth, exactly like `muse login`. The plugin performs the flow
+// only to guide and validate sign-in: model traffic never carries an OAuth
+// token — it goes through the local bridge into the official muse binary,
+// which reads its own credential store.
+//
+// The old mint/list-models calls (POST /muse-code/key, GET /muse-code/models)
+// are gone: Meta closed the direct-subscription API path to external harness
+// clients, and the CLI is now the sole API surface.
+
 import {
-  MINT_URL,
-  MODELS_URL,
   OAUTH_CLIENT_ID,
   OAUTH_DEVICE_AUTH_URL,
   OAUTH_DEVICE_GRANT,
@@ -25,54 +32,6 @@ export type TokenResponse = {
   expires_in?: number
 }
 
-export type SubsUsage = {
-  window?: { used_percent?: number; window_duration_mins?: number; resets_at?: number }
-  weekly?: { used_percent?: number; resets_at?: number }
-  tier?: string
-}
-
-export type MintResponse = {
-  api_key: string
-  base_url: string
-  user_full_name?: string
-  user_email?: string
-  has_payment_method?: boolean
-  require_payment?: boolean
-  is_subs_active?: boolean
-  can_subscribe?: boolean
-  show_subs_upsell?: boolean
-  action_url?: string | null
-  subs_tier_id?: string
-  subs_tier_name?: string
-  is_subs_upgrade_available?: boolean
-  subs_usage?: SubsUsage
-}
-
-export type MuseModelMeta = {
-  name: string
-  family?: string
-  release_date?: string
-  is_hidden?: boolean
-  attachment?: boolean
-  reasoning?: boolean
-  temperature?: boolean
-  tool_call?: boolean
-  modalities?: { input?: string[]; output?: string[] }
-  limit?: { context?: number; output?: number }
-  options?: Record<string, unknown>
-  description?: string | null
-  variants?: Record<string, Record<string, unknown>>
-}
-
-export type MuseModelInfo = {
-  id: string
-  metadata?: { "muse-code"?: MuseModelMeta }
-}
-
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504])
-const MAX_RETRIES = 3
-const REQUEST_TIMEOUT_MS = 60_000
-
 export type OAuthError = Error & { code?: string; status?: number }
 
 function oauthError(message: string, code?: unknown, status?: number): OAuthError {
@@ -80,29 +39,6 @@ function oauthError(message: string, code?: unknown, status?: number): OAuthErro
   if (typeof code === "string") err.code = code
   if (status !== undefined) err.status = status
   return err
-}
-
-function formBody(params: Record<string, string>): string {
-  return new URLSearchParams(params).toString()
-}
-
-async function readJson(res: Response, url: string): Promise<any> {
-  const text = await res.text()
-  try {
-    return text ? JSON.parse(text) : {}
-  } catch {
-    throw oauthError(
-      `muse oauth: non-JSON response from ${url} (status ${res.status}): ${text.slice(0, 200)}`,
-      undefined,
-      res.status,
-    )
-  }
-}
-
-function throwForStatus(json: any, url: string, status: number): never {
-  const code = json?.error ?? json?.title ?? status
-  const detail = json?.error_description ?? json?.Detail ?? json?.error?.message ?? `HTTP ${status}`
-  throw oauthError(`muse oauth ${code}: ${detail} (${url})`, json?.error, status)
 }
 
 async function postForm<T>(url: string, params: Record<string, string>): Promise<T> {
@@ -113,28 +49,22 @@ async function postForm<T>(url: string, params: Record<string, string>): Promise
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     },
-    body: formBody(params),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    body: new URLSearchParams(params).toString(),
+    signal: AbortSignal.timeout(60_000),
   })
-  const json = await readJson(res, url)
-  if (!res.ok) throwForStatus(json, url, res.status)
-  return json as T
-}
-
-async function withRetries<T>(label: string, work: () => Promise<T>): Promise<T> {
-  let lastError: unknown
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      return await work()
-    } catch (err) {
-      const status = (err as { status?: number }).status
-      const retryable = status === undefined || RETRYABLE_STATUSES.has(status)
-      lastError = err
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err
-      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000))
-    }
+  const text = await res.text()
+  let json: any = {}
+  try {
+    json = text ? JSON.parse(text) : {}
+  } catch {
+    throw oauthError(`muse oauth: non-JSON response from ${url} (status ${res.status}): ${text.slice(0, 200)}`)
   }
-  throw lastError instanceof Error ? lastError : new Error(`muse ${label} failed`)
+  if (!res.ok) {
+    const code = json?.error ?? json?.title ?? res.status
+    const detail = json?.error_description ?? json?.Detail ?? json?.error?.message ?? `HTTP ${res.status}`
+    throw oauthError(`muse oauth ${code}: ${detail} (${url})`, json?.error, res.status)
+  }
+  return json as T
 }
 
 /**
@@ -200,75 +130,16 @@ export async function pollDeviceToken(device: DeviceAuth): Promise<TokenResponse
 }
 
 /**
- * Exchanges a `dca:` OAuth access token for a `LLM_` API key, the way the
- * `muse` CLI mints the key it stores next to the login. Minting is
- * idempotent: the same key comes back until it is rotated server-side.
- */
-export async function mintApiKey(dcaToken: string): Promise<MintResponse> {
-  return withRetries("mint", async () => {
-    const res = await fetch(MINT_URL, {
-      method: "POST",
-      headers: {
-        "User-Agent": USER_AGENT,
-        Authorization: `Bearer ${dcaToken}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: "{}",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    })
-    const json = await readJson(res, MINT_URL)
-    if (res.status === 401 || res.status === 403) {
-      throw oauthError(
-        "muse oauth: saved login is no longer valid — run `opencode auth login muse` again",
-        "invalid_grant",
-        res.status,
-      )
-    }
-    if (!res.ok) throwForStatus(json, MINT_URL, res.status)
-    if (typeof json.api_key !== "string" || !json.api_key) {
-      throw oauthError("muse oauth: mint returned an empty api key")
-    }
-    return json as MintResponse
-  })
-}
-
-/**
- * Lists the account's entitled models with opencode-shaped metadata
- * (limits, modalities, options, variants). Called on login and whenever the
- * provider needs fresh model metadata.
- */
-export async function listModels(apiKey: string): Promise<MuseModelInfo[]> {
-  return withRetries("list-models", async () => {
-    const res = await fetch(MODELS_URL, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    })
-    const json = await readJson(res, MODELS_URL)
-    if (!res.ok) throwForStatus(json, MODELS_URL, res.status)
-    const data = Array.isArray(json?.data) ? json.data : []
-    return data.filter((m: unknown) => typeof (m as { id?: unknown }).id === "string") as MuseModelInfo[]
-  })
-}
-
-/**
- * Normalizes a user-facing reasoning effort to the wire value for
- * `reasoning_effort`, or undefined when the server default should apply.
- * Unknown values are dropped (never sent) so a typo degrades to the default
- * instead of failing the request.
+ * Normalizes a user-facing reasoning effort to the CLI's `--reasoning-effort`
+ * value, or undefined when the default should apply. Through the bridge the
+ * CLI's own ladder applies — including `ultra`, which the old direct API
+ * rejected but the binary accepts.
  */
 export function mapEffort(effort: unknown): string | undefined {
   if (typeof effort !== "string") return undefined
   const normalized = effort.trim().toLowerCase()
   if (normalized === "" || normalized === "auto" || normalized === "default") return undefined
   if (normalized === "off") return "none"
-  // The muse CLI advertises `ultra`, but the API rejects it; `max` is the
-  // strongest accepted tier.
-  if (normalized === "ultra") return "max"
   if (REASONING_EFFORTS.has(normalized)) return normalized
   return undefined
 }

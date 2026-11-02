@@ -38,6 +38,6 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/muse.js --log-level=warning"
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/muse.js --log-level=warning && esbuild src/bridge/main.ts --bundle --platform=node --format=esm --outfile=dist/muse-bridge.js --log-level=warning"
   }
 }

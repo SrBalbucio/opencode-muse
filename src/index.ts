@@ -1,138 +1,65 @@
 import { Plugin } from "@opencode/plugin"
-import { ACCOUNT_URL, MINT_TTL_MS, OAUTH_METHOD_ID, PLUGIN_ID, PROVIDER_ID } from "./constants.ts"
+import { ACCOUNT_URL, OAUTH_METHOD_ID, PLUGIN_ID, PROVIDER_ID } from "./constants.ts"
 import {
   credentialLabel,
-  isCredentialExpiring,
-  isMuseOAuthCredential,
   providerInfo,
   resolveEffort,
   staticModelInfos,
-  toModelInfos,
-  toOAuthCredential,
+  toBridgeCredential,
 } from "./models.ts"
-import { readMuseCliAuth } from "./muse-store.ts"
-import {
-  registerMuseProvider,
-  retryWithFreshKey,
-  subscriptionRequiredMessage,
-  subscriptionSummary,
-} from "./hooks.ts"
-import { listModels, mintApiKey, pollDeviceToken, startDeviceAuth } from "./oauth.ts"
+import { readMuseCliAuth, writeMuseCliAuth } from "./muse-store.ts"
+import { museUsageText, resolveMuseBinary, usageSummaryLine } from "./bridge/cli.ts"
+import { startBridgeServer, type BridgeServer } from "./bridge/server.ts"
+import { registerMuseProvider } from "./hooks.ts"
+import { pollDeviceToken, startDeviceAuth } from "./oauth.ts"
 
 // IMPORTANT: this module's default export is the whole plugin definition.
 // Keep supporting modules beside it; the loader treats every top-level file
 // as a plugin candidate, so only this file may default-export a definition.
 
 /**
- * Muse subscription for opencode, mirroring the official `muse` CLI:
+ * Muse subscription for opencode, routed through the official muse CLI:
  *
- * - `provider.transform` contributes the `muse` OpenAI-compatible provider
- *   (`https://api.meta.ai/v1`) with the account's model inventory, refreshed
- *   from `/muse-code/models` whenever a credential is available.
- * - `integration.transform` registers the device-flow OAuth login (the same
- *   flow as `muse login`). When `muse login` was already run, its token is
- *   reused read-only and no browser approval is needed.
- * - `http.request` sets the minted API key on every request, re-minting past
- *   the checkpoint; `retry` re-mints once more on a 401 and retries.
- * - `context`/`compaction`/`generate`/`title` resolve the semantic
- *   `reasoningEffort` from the selected variant/model settings.
+ * - setup hosts the local bridge (OpenAI-compatible HTTP server on loopback)
+ *   in-process; `provider.transform` contributes the `muse` provider pointing
+ *   at it, so Meta only ever sees the CLI's own client.
+ * - `integration.transform` registers the device-flow login as GUIDANCE: a
+ *   healthy `muse login` on the machine is reused with no browser; the device
+ *   flow itself validates the account but model credentials still come from
+ *   the CLI's auth.json.
+ * - `http.request` stamps the bridge's bearer token; reasoning effort maps
+ *   the semantic variant to the CLI's `--reasoning-effort` ladder.
  */
+
+function bridgeLoginErrorMessage(): string {
+  const hint = resolveMuseBinary()
+    ? "run `muse login` in a terminal, then retry"
+    : "install the muse CLI first (see the opencode-muse README), then run `muse login`"
+  return `muse: no usable CLI login — ${hint}`
+}
+
+async function probeCliUsage(): Promise<string> {
+  const bin = resolveMuseBinary()
+  if (!bin) throw new Error(bridgeLoginErrorMessage())
+  return await museUsageText({ bin, extraFirstArg: process.env.MUSE_BIN_EXTRA })
+}
+
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
     const source = { models: staticModelInfos() }
-    let override: { access: string; expiresAt: number } | undefined
-    let mintPromise: Promise<string> | undefined
-    const authRetries = new Map<string, number>()
 
-    const loadInventory = async (apiKey: string) => {
-      try {
-        const mapped = toModelInfos(await listModels(apiKey))
-        return mapped.length > 0 ? mapped : undefined
-      } catch {
-        return undefined
-      }
-    }
-
-    const refreshModels = async (apiKey: string) => {
-      const mapped = await loadInventory(apiKey)
-      if (!mapped) return
-      source.models = mapped
-      await ctx.provider.reload().catch(() => undefined)
-    }
-
-    const mintFresh = async (dcaToken: string): Promise<string> => {
-      if (mintPromise) return mintPromise
-      mintPromise = (async () => {
-        try {
-          const minted = await mintApiKey(dcaToken)
-          override = { access: minted.api_key, expiresAt: Date.now() + MINT_TTL_MS }
-          return minted.api_key
-        } finally {
-          mintPromise = undefined
-        }
-      })()
-      return mintPromise
-    }
-
-    const resolveCredential = async () => {
-      const connection = await ctx.integration.connection.active(PROVIDER_ID).catch(() => undefined)
-      const credential = connection
-        ? await ctx.integration.connection.resolve(connection).catch(() => undefined)
-        : undefined
-      return isMuseOAuthCredential(credential) ? credential : undefined
-    }
-
-    const resolveAccess = async (): Promise<string> => {
-      if (override && override.expiresAt > Date.now()) return override.access
-      const credential = await resolveCredential()
-      if (credential) {
-        if (!isCredentialExpiring(credential.expires)) return credential.access
-        try {
-          return await mintFresh(credential.refresh)
-        } catch {
-          return credential.access
-        }
-      }
-      // Zero-login path: an existing `muse login` is enough to mint from.
-      const museCli = await readMuseCliAuth()
-      if (museCli) {
-        try {
-          return await mintFresh(museCli.accessToken)
-        } catch {
-          // Fall through to the login error below.
-        }
-      }
-      throw new Error(
-        "muse: not logged in — run `opencode auth login`, choose Muse, and approve the device code (or run `muse login` first)",
-      )
-    }
-
-    // Load account-specific inventory before registering the source.
+    // In-process bridge. A reload re-runs setup and binds a fresh ephemeral
+    // port; the previous socket simply goes unreferenced until process exit.
+    let bridge: BridgeServer
     try {
-      const credential = await resolveCredential()
-      if (credential) {
-        const mapped = await loadInventory(credential.access)
-        if (mapped) source.models = mapped
-      } else {
-        const museCli = await readMuseCliAuth()
-        if (museCli) {
-          try {
-            const minted = await mintApiKey(museCli.accessToken)
-            override = { access: minted.api_key, expiresAt: Date.now() + MINT_TTL_MS }
-            const mapped = await loadInventory(minted.api_key)
-            if (mapped) source.models = mapped
-          } catch {
-            // Static inventory; requests re-attempt the mint.
-          }
-        }
-      }
-    } catch {
-      // Static inventory.
+      bridge = await startBridgeServer({})
+    } catch (err) {
+      throw new Error(`muse: could not start the local bridge — ${String(err)}`)
     }
 
     await ctx.provider.transform((editor) => {
-      registerMuseProvider(editor, providerInfo(), source.models)
+      registerMuseProvider(editor, providerInfo({ baseURL: `${bridge.url}/v1`, apiKey: bridge.token }), source.models)
     })
 
     await ctx.integration.transform((editor) => {
@@ -141,24 +68,24 @@ export default Plugin.define({
         method: {
           id: OAUTH_METHOD_ID,
           type: "oauth",
-          label: "Muse Code (device flow)",
+          label: "Muse Code (via muse CLI)",
         },
         authorize: async () => {
-          // Fast path: reuse an existing `muse login` with no browser.
-          const museCli = await readMuseCliAuth()
-          if (museCli) {
+          // Fast path: a working `muse login` needs no browser at all.
+          const existing = await readMuseCliAuth()
+          if (existing) {
             try {
-              const minted = await mintApiKey(museCli.accessToken)
-              const credential = toOAuthCredential(museCli.accessToken, minted)
-              await refreshModels(minted.api_key)
+              const usage = await probeCliUsage()
+              const summary = usageSummaryLine(usage)
               return {
                 url: ACCOUNT_URL,
-                instructions: `Found an existing muse CLI login — reusing it, no browser approval needed.${subscriptionSummary(minted)}`,
+                instructions: `Using the existing muse CLI login${summary ? ` — ${summary}` : ""}. No browser approval needed; model traffic runs through the CLI.`,
                 mode: "auto",
-                callback: Promise.resolve(credential),
+                callback: Promise.resolve(toBridgeCredential(existing.email ? { email: existing.email } : {})),
               } as const
             } catch {
-              // Fall through to the device flow below.
+              // auth.json exists but the CLI rejects it — fall through so the
+              // device flow can at least revalidate the account and guide.
             }
           }
 
@@ -169,20 +96,34 @@ export default Plugin.define({
             mode: "auto",
             callback: (async () => {
               const tokens = await pollDeviceToken(device)
-              const minted = await mintApiKey(tokens.access_token)
-              const action = subscriptionRequiredMessage(minted)
-              if (action) throw new Error(action)
-              const credential = toOAuthCredential(tokens.access_token, minted)
-              await refreshModels(minted.api_key)
-              return credential
+
+              // Experimental zero-terminal path: store the token where the
+              // CLI reads it, then verify through the CLI itself.
+              if (process.env.MUSE_EXPERIMENTAL_AUTH_WRITE === "1") {
+                await writeMuseCliAuth(tokens.access_token)
+              }
+
+              const after = await readMuseCliAuth()
+              if (!after) {
+                throw new Error(
+                  "muse: device login approved, but this machine has no muse CLI credentials — run `muse login` in a terminal with the same account; opencode routes model traffic through the CLI.",
+                )
+              }
+              try {
+                await probeCliUsage()
+              } catch {
+                throw new Error(
+                  "muse: device login approved, but the muse CLI rejected this machine's stored login — run `muse login` again with the same account.",
+                )
+              }
+              return toBridgeCredential(after.email ? { email: after.email } : {})
             })(),
           } as const
         },
         refresh: async (credential) => {
-          const minted = await mintApiKey(credential.refresh)
-          override = { access: minted.api_key, expiresAt: Date.now() + MINT_TTL_MS }
-          void refreshModels(minted.api_key)
-          return { ...credential, access: minted.api_key, expires: Date.now() + MINT_TTL_MS }
+          // The marker carries no secret; the CLI's own login is the real
+          // credential. Refresh just keeps opencode from nagging about expiry.
+          return { ...credential, expires: Date.now() + 24 * 60 * 60 * 1000 }
         },
         label: (credential) => credentialLabel(credential),
       })
@@ -191,29 +132,9 @@ export default Plugin.define({
     await ctx.session.hook(
       "http.request",
       async (event) => {
-        const access = await resolveAccess()
         const headers = new Headers(event.request.headers)
-        headers.set("authorization", `Bearer ${access}`)
+        headers.set("authorization", `Bearer ${bridge.token}`)
         event.request = new Request(event.request, { headers })
-      },
-      { providerID: PROVIDER_ID },
-    )
-
-    await ctx.session.hook(
-      "retry",
-      async (event) => {
-        try {
-          await retryWithFreshKey(event, {
-            lastRetryAt: authRetries,
-            resolveToken: async () => {
-              const credential = await resolveCredential()
-              return credential?.refresh ?? (await readMuseCliAuth())?.accessToken
-            },
-            mint: mintFresh,
-          })
-        } catch {
-          // Let the original error stand.
-        }
       },
       { providerID: PROVIDER_ID },
     )

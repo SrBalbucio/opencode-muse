@@ -1,19 +1,18 @@
 import { strict as assert } from "node:assert"
 import { describe, it } from "node:test"
-import { DEFAULT_MODEL_ID, MINT_TTL_MS, OAUTH_METHOD_ID, PROVIDER_ID } from "../src/constants.ts"
+import { CREDENTIAL_TTL_MS, DEFAULT_MODEL_ID, OAUTH_METHOD_ID, PROVIDER_ID } from "../src/constants.ts"
 import {
   credentialLabel,
-  isAuthRetryable,
-  isCredentialExpiring,
   isMuseOAuthCredential,
+  isValidEffort,
   providerInfo,
   resolveEffort,
   staticModelInfos,
+  toBridgeCredential,
   toModelInfo,
   toModelInfos,
-  toOAuthCredential,
 } from "../src/models.ts"
-import type { MintResponse, MuseModelInfo } from "../src/oauth.ts"
+import type { MuseModelInfo } from "../src/models.ts"
 
 function meta(overrides = {}) {
   return {
@@ -36,11 +35,13 @@ function meta(overrides = {}) {
 }
 
 describe("providerInfo", () => {
-  it("registers the openai-compatible package with baseURL", () => {
-    const info = providerInfo()
+  it("registers the openai-compatible package against the bridge", () => {
+    const info = providerInfo({ baseURL: "http://127.0.0.1:9999/v1", apiKey: "tok" })
     assert.equal(info.id, PROVIDER_ID)
     assert.equal(info.package, "@opencode/ai/providers/openai-compatible")
-    assert.equal((info.settings as Record<string, unknown>).baseURL, "https://api.meta.ai/v1")
+    const settings = info.settings as Record<string, unknown>
+    assert.equal(settings.baseURL, "http://127.0.0.1:9999/v1")
+    assert.equal(settings.apiKey, "tok")
     assert.equal(info.integrationID, PROVIDER_ID)
     assert.equal(info.activation, "enabled")
   })
@@ -91,7 +92,7 @@ describe("toModelInfo", () => {
 })
 
 describe("staticModelInfos", () => {
-  it("contains the default model with full limits and tiers", () => {
+  it("contains the default model with the full effort ladder including ultra", () => {
     const models = staticModelInfos()
     const current = models.find((m) => m.id === DEFAULT_MODEL_ID)!
     assert.ok(current)
@@ -99,7 +100,7 @@ describe("staticModelInfos", () => {
     assert.ok(current.limit.output > 0)
     assert.deepEqual(
       current.variants.map((v) => v.id).sort(),
-      ["high", "low", "max", "medium", "minimal", "xhigh"],
+      ["high", "low", "max", "medium", "minimal", "ultra", "xhigh"],
     )
   })
 })
@@ -107,10 +108,11 @@ describe("staticModelInfos", () => {
 describe("resolveEffort", () => {
   const model = {
     settings: { reasoningEffort: "high" },
-    variants: [{ id: "low", settings: { reasoningEffort: "low" } }],
+    variants: [{ id: "low", settings: { reasoningEffort: "low" } }, { id: "ultra", settings: { reasoningEffort: "ultra" } }],
   }
   it("prefers the selected variant then model settings", () => {
     assert.equal(resolveEffort({ variant: "low" }, model), "low")
+    assert.equal(resolveEffort({ variant: "ultra" }, model), "ultra")
     assert.equal(resolveEffort({}, model), "high")
     assert.equal(resolveEffort({ variant: "missing" }, model), "high")
   })
@@ -121,44 +123,34 @@ describe("resolveEffort", () => {
   })
 })
 
-describe("credentials", () => {
-  const minted = {
-    api_key: "LLM_test",
-    base_url: "https://api.meta.ai/v1",
-    user_email: "a@b.c",
-    subs_tier_name: "Tier",
-  } as MintResponse
-
-  it("builds a stored oauth credential from a grant", () => {
+describe("marker credential", () => {
+  it("carries metadata but no secrets", () => {
     const before = Date.now()
-    const credential = toOAuthCredential("dca:test", minted)
+    const credential = toBridgeCredential({ email: "a@b.c" })
     assert.equal(credential.type, "oauth")
     assert.equal(credential.methodID, OAUTH_METHOD_ID)
-    assert.equal(credential.refresh, "dca:test")
-    assert.equal(credential.access, "LLM_test")
-    assert.ok(credential.expires >= before + MINT_TTL_MS)
+    assert.equal(credential.access, "bridge")
+    assert.equal(credential.refresh, "bridge")
+    assert.ok(credential.expires >= before + CREDENTIAL_TTL_MS - 1000)
     assert.equal(credentialLabel(credential), "a@b.c")
+    assert.equal(isMuseOAuthCredential(credential), true)
   })
 
-  it("recognizes muse oauth credentials", () => {
-    assert.equal(isMuseOAuthCredential(toOAuthCredential("dca:x", minted)), true)
+  it("omits empty metadata and rejects other credential shapes", () => {
+    const credential = toBridgeCredential()
+    assert.equal(credential.metadata, undefined)
+    assert.equal(credentialLabel(credential), undefined)
     assert.equal(isMuseOAuthCredential({ type: "oauth", methodID: "other" }), false)
     assert.equal(isMuseOAuthCredential({ type: "key", key: "x" }), false)
     assert.equal(isMuseOAuthCredential(undefined), false)
   })
-
-  it("detects expiring checkpoints", () => {
-    assert.equal(isCredentialExpiring(Date.now() + MINT_TTL_MS), false)
-    assert.equal(isCredentialExpiring(Date.now() - 1000), true)
-  })
 })
 
-describe("isAuthRetryable", () => {
-  it("matches 401s and auth messages only", () => {
-    assert.equal(isAuthRetryable({ status: 401 }), true)
-    assert.equal(isAuthRetryable({ status: 400, message: "bad request" }), false)
-    assert.equal(isAuthRetryable({ message: "Unauthorized" }), true)
-    assert.equal(isAuthRetryable({ type: "authentication_error", message: "x" }), true)
-    assert.equal(isAuthRetryable({ status: 500, message: "boom" }), false)
+describe("isValidEffort", () => {
+  it("accepts the CLI ladder including ultra", () => {
+    for (const tier of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+      assert.equal(isValidEffort(tier), true, tier)
+    }
+    assert.equal(isValidEffort("bogus"), false)
   })
 })

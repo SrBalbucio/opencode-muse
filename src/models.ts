@@ -1,27 +1,47 @@
 import { Integration, Model, Provider, type Credential } from "@opencode/plugin"
 import {
-  API_BASE_URL,
+  CREDENTIAL_TTL_MS,
   DEFAULT_MODEL_ID,
-  MINT_TTL_MS,
   OAUTH_METHOD_ID,
   PROVIDER_ID,
   PROVIDER_NAME,
   PROVIDER_PACKAGE,
-  REFRESH_SAFETY_WINDOW_MS,
+  REASONING_EFFORTS,
 } from "./constants.ts"
-import { mapEffort, type MintResponse, type MuseModelInfo, type MuseModelMeta } from "./oauth.ts"
+import { mapEffort } from "./oauth.ts"
+
+export type MuseModelMeta = {
+  name: string
+  family?: string
+  release_date?: string
+  is_hidden?: boolean
+  attachment?: boolean
+  reasoning?: boolean
+  temperature?: boolean
+  tool_call?: boolean
+  modalities?: { input?: string[]; output?: string[] }
+  limit?: { context?: number; output?: number }
+  options?: Record<string, unknown>
+  description?: string | null
+  variants?: Record<string, Record<string, unknown>>
+}
+
+export type MuseModelInfo = {
+  id: string
+  metadata?: { "muse-code"?: MuseModelMeta }
+}
 
 export function providerID() {
   return Provider.ID.make(PROVIDER_ID)
 }
 
-export function providerInfo(): Provider.Info {
+export function providerInfo(bridge: { baseURL: string; apiKey: string }): Provider.Info {
   return {
     ...Provider.Info.empty(providerID()),
     name: PROVIDER_NAME,
     activation: "enabled",
     package: PROVIDER_PACKAGE,
-    settings: { baseURL: API_BASE_URL },
+    settings: { baseURL: bridge.baseURL, apiKey: bridge.apiKey },
     integrationID: Integration.ID.make(PROVIDER_ID),
   }
 }
@@ -56,7 +76,7 @@ function modelSettings(meta: MuseModelMeta): Record<string, unknown> {
 }
 
 /**
- * Maps server discovery to a v2 model definition. Cost is left empty: the
+ * Maps discovery metadata to a v2 model definition. Cost is left empty: the
  * subscription bills a flat rate, not per token.
  */
 export function toModelInfo(info: MuseModelInfo): Model.Info | undefined {
@@ -121,6 +141,7 @@ function staticMeta(
           high: { reasoningEffort: "high" },
           xhigh: { reasoningEffort: "xhigh" },
           max: { reasoningEffort: "max" },
+          ultra: { reasoningEffort: "ultra" },
           ...extraVariants,
         },
       },
@@ -129,9 +150,8 @@ function staticMeta(
 }
 
 /**
- * Static fallback inventory, mirroring live discovery. Used until the first
- * discovery refresh (and when offline); refreshed from the server whenever a
- * credential is available.
+ * Static inventory, mirroring the CLI's catalog (`muse model-profile show
+ * <id>`). The bridge serves the same ids (see MODEL_IDS in constants.ts).
  */
 export function staticModelInfos(): Model.Info[] {
   return toModelInfos([
@@ -170,23 +190,23 @@ export function resolveEffort(
   return mapEffort(pickEffort(variant?.settings) ?? pickEffort(model.settings))
 }
 
+// ---------------------------------------------------------------------------
+// Marker credential
+// ---------------------------------------------------------------------------
+
 /**
- * Builds the stored OAuth credential from a device-flow grant:
- * - `access`: the minted `LLM_` API key, sent as the Bearer token to
- *   `https://api.meta.ai/v1/*`.
- * - `refresh`: the `dca:` OAuth token, used only to mint fresh API keys.
- * - `expires`: the next re-mint checkpoint (minting is idempotent).
+ * Login marker stored in opencode's auth store. It carries no secret: the
+ * real credentials live in the muse CLI's own `auth.json`, and model traffic
+ * rides the local bridge into the CLI. Metadata (email/tier) only feeds the
+ * login screen.
  */
-export function toOAuthCredential(dcaToken: string, minted: MintResponse): Credential.OAuth {
-  const metadata: Record<string, unknown> = {}
-  if (minted.user_email) metadata.email = minted.user_email
-  if (minted.subs_tier_name) metadata.tier = minted.subs_tier_name
+export function toBridgeCredential(metadata: Record<string, unknown> = {}): Credential.OAuth {
   return {
     type: "oauth",
     methodID: Integration.MethodID.make(OAUTH_METHOD_ID),
-    refresh: dcaToken,
-    access: minted.api_key,
-    expires: Date.now() + MINT_TTL_MS,
+    refresh: "bridge",
+    access: "bridge",
+    expires: Date.now() + CREDENTIAL_TTL_MS,
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
   }
 }
@@ -203,20 +223,12 @@ export function isMuseOAuthCredential(value: unknown): value is Credential.OAuth
   )
 }
 
-export function isCredentialExpiring(expires: number): boolean {
-  return expires - Date.now() < REFRESH_SAFETY_WINDOW_MS
-}
-
 export function credentialLabel(credential: Credential.OAuth): string | undefined {
   const email = (credential.metadata as Record<string, unknown> | undefined)?.email
   return typeof email === "string" ? email : undefined
 }
 
-/**
- * Whether a failed request looks like expired/rotated credentials and is
- * worth exactly one re-mint plus retry.
- */
-export function isAuthRetryable(error: { status?: number; type?: string; message?: string }): boolean {
-  if (error.status === 401) return true
-  return /unauthor|authentication|invalid_api_key|invalid_grant/i.test(`${error.type ?? ""} ${error.message ?? ""}`)
+/** Whether an effort tier is one the muse CLI accepts. */
+export function isValidEffort(effort: string): boolean {
+  return REASONING_EFFORTS.has(effort)
 }
