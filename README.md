@@ -19,8 +19,8 @@ Meta closed the direct subscription API to external harness clients, so the old
 mint-a-key-and-call-the-API path no longer works. The bridge keeps OpenCode as
 the harness (its tools, its UI, its sessions) while the official CLI makes every
 model call: each completion spawns one headless `muse exec --json` with the
-agent loop neutralized (`--preset empty`, no shell/write/web tools,
-`--max-model-steps 1`) and the reply pinned to a JSON envelope via
+agent loop neutralized (`--preset empty`, `--max-model-steps 1`) and the reply
+pinned to a JSON envelope via
 `--output-schema`. The envelope is translated back into OpenAI-shaped
 `tool_calls`, so OpenCode's tools keep working end to end.
 

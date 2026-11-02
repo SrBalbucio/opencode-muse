@@ -2,9 +2,9 @@
 // event stream (JSONL envelopes: record_type status|event|reconciliation with
 // payload.kind carrying the semantics).
 //
-// The exec runs with every agent capability disabled (`--preset empty`,
-// no shell/write/web tools, one model step) — it is a model round-trip, not a
-// nested agent run. OpenCode stays the only harness.
+// The exec runs the agent loop neutralized (`--preset empty`, one model
+// step) — it is a model round-trip, not a nested agent run. OpenCode stays
+// the only harness. Note: no `--disable-*` tool flags — see buildExecArgs.
 
 import { spawn } from "node:child_process"
 import fs from "node:fs"
@@ -155,9 +155,17 @@ export type ExecArgsOptions = {
 
 /**
  * One completion = one exec with the agent loop neutralized:
- * `--preset empty` drops skills/reminders, disabled tool classes and
- * `--max-model-steps 1` guarantee exactly one model round-trip, and
- * `--output-schema` pins the reply to the tool-call envelope.
+ * `--preset empty` drops skills/reminders and `--max-model-steps 1`
+ * guarantees exactly one model round-trip, and `--output-schema` pins the
+ * reply to the tool-call envelope.
+ *
+ * The `--disable-shell` / `--disable-write` / `--disable-web-tools` flags are
+ * deliberately NOT passed. They make the CLI inject a `capability_policy`
+ * fact into its system prompt ("Shell execution is disabled for this
+ * session... Work read-only"), and the model then refuses to call the
+ * harness's bash/edit/web tools even in build mode. CLI-side execution stays
+ * impossible without them: the single model step's reply is schema-pinned to
+ * the envelope, which cannot express CLI tool calls, and the run ends there.
  */
 export function buildExecArgs(options: ExecArgsOptions): string[] {
   const args = [
@@ -166,9 +174,6 @@ export function buildExecArgs(options: ExecArgsOptions): string[] {
     "--no-session-log",
     "--preset",
     "empty",
-    "--disable-shell",
-    "--disable-write",
-    "--disable-web-tools",
     "--max-model-steps",
     "1",
     "--model",

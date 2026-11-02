@@ -33,7 +33,7 @@ describe("resolveMuseBinary", () => {
 })
 
 describe("buildExecArgs", () => {
-  it("disables every agent capability and pins one step", () => {
+  it("neutralizes the agent loop without capability_policy flags", () => {
     const args = buildExecArgs({
       model: "muse-spark-1.3",
       effort: "high",
@@ -47,9 +47,6 @@ describe("buildExecArgs", () => {
       "--no-session-log",
       "--preset",
       "empty",
-      "--disable-shell",
-      "--disable-write",
-      "--disable-web-tools",
       "--max-model-steps",
       "1",
       "--model",
@@ -63,6 +60,11 @@ describe("buildExecArgs", () => {
       "--image",
       "a.png",
     ])
+    // The disable flags would inject "shell/write disabled" policy text into
+    // the CLI's system prompt and make the model refuse harness tools.
+    assert.ok(!args.includes("--disable-shell"))
+    assert.ok(!args.includes("--disable-write"))
+    assert.ok(!args.includes("--disable-web-tools"))
   })
 
   it("drops invalid effort tiers instead of failing the CLI", () => {
