@@ -18,6 +18,15 @@ function flagValue(args: readonly string[], name: string): string | undefined {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log("muse-bridge — OpenAI-compatible server over the muse CLI")
+    console.log("")
+    console.log("Usage: node muse-bridge.js [--port N] [--token T] [--host H] [--idle-exit-seconds N]")
+    console.log("")
+    console.log("Endpoints: /v1/chat/completions, /v1/models, /healthz (bearer token required)")
+    console.log("Binary: MUSE_BIN env, ~/.local/bin/muse*, or PATH")
+    return
+  }
   const port = Number.parseInt(flagValue(args, "--port") ?? "", 10)
   const idleSeconds = Number.parseInt(flagValue(args, "--idle-exit-seconds") ?? "", 10)
   const token = flagValue(args, "--token") ?? crypto.randomBytes(24).toString("base64url")
