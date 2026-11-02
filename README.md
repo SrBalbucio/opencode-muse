@@ -62,7 +62,7 @@ muse login
 ### 3. The plugin
 
 ```sh
-git clone https://github.com/danzilberdan/opencode-muse.git
+git clone https://github.com/SrBalbucio/opencode-muse.git
 cd opencode-muse
 pnpm install
 pnpm run build
